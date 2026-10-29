@@ -1,7 +1,7 @@
 cask "typing-stats" do
   auto_updates true
-  version "0.0.27"
-  sha256 "fb1071c29173fb9483af5e0b77b6de3b6d8cd51c8e0d67507ac7991b76afad2f"
+  version "0.0.28"
+  sha256 "3ed653488fc16bc501eafd03ba4df486e0e17f888d74e5ac211e0b975b18c8f4"
 
   url "https://github.com/rauchg/typing-stats/releases/download/v#{version}/TypingStats.zip"
   name "Typing Stats"
