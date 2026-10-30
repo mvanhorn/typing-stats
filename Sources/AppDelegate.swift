@@ -8,13 +8,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var localKeystrokeCount: Int = 0
     private var localAppCounts: [String: Int] = [:]  // bundleID -> count for today
     private var totalKeystrokeCount: Int = 0
-    private var eventTap: CFMachPort?
+    private var localExtras = DayExtras()  // dictation + WPM metrics for today on this device
+    private var lastTypingKeyTime: Date?
+    private var unsavedCount = 0
+    private var unsyncedCount = 0
+    private let micTracker = MicSessionTracker()
+    /// Gaps between keystrokes longer than this end a typing burst (not counted as typing time).
+    private let typingIdleThreshold: TimeInterval = 2.0
+    fileprivate var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var hasAccessibilityPermission = false
     private var permissionCheckTimer: Timer?
     private var syncTimer: Timer?
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var lastSyncTime: Date?
+    // in-memory cache; disk syncs happen async
+    private var cachedSyncData = SyncData()
     private var updateChecker = UpdateChecker.shared
     private var updateDotLayer: CALayer?
 
@@ -56,6 +65,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installMainMenu()
 
         loadLocalCount()
         loadAndReconcileCounts()
@@ -71,6 +81,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             startPermissionCheckTimer()
         }
 
+        micTracker.start()
         startSyncTimer()
         startFileMonitor()
         _ = updateChecker // Initialize Sparkle
@@ -84,6 +95,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
 
         checkFirstRun()
+    }
+
+    /// Hidden main menu (accessory apps don't show it) so standard shortcuts work in our windows:
+    /// Cmd+W close, Cmd+Q quit, Cmd+M minimize, and Edit shortcuts.
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowItem.submenu = windowMenu
+        mainMenu.addItem(windowItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     @objc private func handleUpdateAvailable() {
@@ -124,14 +168,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let finalCount = localKeystrokeCount
 
         let finalAppCounts = localAppCounts
+        let finalExtras = localExtras
         coordinatedSync(to: url) { existingData in
             var syncData = existingData
             if syncData.devices[self.deviceID] == nil {
                 syncData.devices[self.deviceID] = DeviceData()
             }
-            let existingCount = syncData.devices[self.deviceID]?.count(for: today) ?? 0
+            let existing = syncData.devices[self.deviceID]?.dailyCounts[today]
+            let existingCount = existing?.count ?? 0
             if finalCount > existingCount {
-                syncData.devices[self.deviceID]?.setCount(finalCount, for: today, appCounts: finalAppCounts.isEmpty ? nil : finalAppCounts)
+                syncData.devices[self.deviceID]?.setCount(finalCount, for: today, appCounts: finalAppCounts.isEmpty ? nil : finalAppCounts, extras: finalExtras)
+            } else if finalCount == existingCount, let existing = existing {
+                // Typing time can grow without the count changing (e.g. after a pause); keep the max.
+                syncData.devices[self.deviceID]?.dailyCounts[today]?.extras = existing.extras.merged(with: finalExtras)
             }
             syncData.pruneAllDevices(keepingDays: 365)
             return syncData
@@ -147,15 +196,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if state.date == todayString() {
                 localKeystrokeCount = state.count
                 localAppCounts = state.appCounts ?? [:]
+                localExtras = state.extras ?? DayExtras()
             } else {
                 localKeystrokeCount = 0
                 localAppCounts = [:]
+                localExtras = DayExtras()
             }
         }
     }
 
     private func saveLocalCount() {
-        let state = LocalState(date: todayString(), count: localKeystrokeCount, appCounts: localAppCounts.isEmpty ? nil : localAppCounts)
+        unsavedCount = 0
+        let state = LocalState(date: todayString(), count: localKeystrokeCount, appCounts: localAppCounts.isEmpty ? nil : localAppCounts, extras: localExtras.isEmpty ? nil : localExtras)
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: localDefaultsKey)
         }
@@ -184,7 +236,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Fresh start for today - reset cloud to 0, don't pull corrupted data
                 updated.devices[self.deviceID]?.setCount(0, for: today, appCounts: nil)
             } else if self.localKeystrokeCount > existingCount {
-                updated.devices[self.deviceID]?.setCount(self.localKeystrokeCount, for: today, appCounts: self.localAppCounts.isEmpty ? nil : self.localAppCounts)
+                updated.devices[self.deviceID]?.setCount(self.localKeystrokeCount, for: today, appCounts: self.localAppCounts.isEmpty ? nil : self.localAppCounts, extras: self.localExtras)
             } else {
                 self.localKeystrokeCount = existingCount
                 // Also load app counts from cloud if available
@@ -192,9 +244,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if !cloudAppCounts.isEmpty {
                     self.localAppCounts = cloudAppCounts
                 }
+                let cloudExtras = updated.devices[self.deviceID]?.extras(for: today) ?? DayExtras()
+                self.localExtras = self.localExtras.merged(with: cloudExtras)
             }
 
             updated.pruneAllDevices(keepingDays: 365)
+            self.cachedSyncData = updated
             self.totalKeystrokeCount = updated.totalCount(for: today)
             self.saveLocalCount()
             return updated
@@ -263,6 +318,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let today = todayString()
         let currentLocalCount = localKeystrokeCount
         let currentAppCounts = localAppCounts
+        let currentExtras = localExtras
+        unsyncedCount = 0
 
         syncQueue.async { [weak self] in
             guard let self = self else { return }
@@ -274,23 +331,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     syncData.devices[self.deviceID] = DeviceData()
                 }
 
-                let existingCount = syncData.devices[self.deviceID]?.count(for: today) ?? 0
+                let existing = syncData.devices[self.deviceID]?.dailyCounts[today]
+                let existingCount = existing?.count ?? 0
 
                 if currentLocalCount > existingCount {
-                    syncData.devices[self.deviceID]?.setCount(currentLocalCount, for: today, appCounts: currentAppCounts.isEmpty ? nil : currentAppCounts)
+                    syncData.devices[self.deviceID]?.setCount(currentLocalCount, for: today, appCounts: currentAppCounts.isEmpty ? nil : currentAppCounts, extras: currentExtras)
+                } else if currentLocalCount == existingCount, let existing = existing {
+                    syncData.devices[self.deviceID]?.dailyCounts[today]?.extras = existing.extras.merged(with: currentExtras)
                 }
 
                 return syncData
             }
 
             let syncData = self.loadSyncData(from: url)
-            let newTotal = syncData.totalCount(for: today)
 
             DispatchQueue.main.async {
+                self.cachedSyncData = syncData
+                // Re-apply local count — may have advanced while sync was in flight
+                if self.cachedSyncData.devices[self.deviceID] == nil {
+                    self.cachedSyncData.devices[self.deviceID] = DeviceData()
+                }
+                self.cachedSyncData.devices[self.deviceID]?.setCount(self.localKeystrokeCount, for: today, appCounts: self.localAppCounts.isEmpty ? nil : self.localAppCounts, extras: self.localExtras)
                 self.lastSyncTime = Date()
 
-                if newTotal != self.totalKeystrokeCount {
-                    self.totalKeystrokeCount = newTotal
+                let reconciledTotal = self.cachedSyncData.totalCount(for: today)
+                if reconciledTotal != self.totalKeystrokeCount {
+                    self.totalKeystrokeCount = reconciledTotal
                     self.updateMenuBarTitle()
                 }
             }
@@ -344,18 +410,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let cloudDeviceData = syncData.devices[self.deviceID] {
                 let cloudCount = cloudDeviceData.count(for: today)
                 if cloudCount > self.localKeystrokeCount {
+                    let cloudExtras = cloudDeviceData.extras(for: today)
                     DispatchQueue.main.async {
                         self.localKeystrokeCount = cloudCount
+                        self.localExtras = self.localExtras.merged(with: cloudExtras)
                         self.saveLocalCount()
                     }
                 }
             }
 
-            let newTotal = syncData.totalCount(for: today)
+            DispatchQueue.main.async {
+                self.cachedSyncData = syncData
+                // Re-apply local count — may have advanced while reading file
+                if self.cachedSyncData.devices[self.deviceID] == nil {
+                    self.cachedSyncData.devices[self.deviceID] = DeviceData()
+                }
+                self.cachedSyncData.devices[self.deviceID]?.setCount(self.localKeystrokeCount, for: today, appCounts: self.localAppCounts.isEmpty ? nil : self.localAppCounts, extras: self.localExtras)
 
-            if newTotal != self.totalKeystrokeCount {
-                DispatchQueue.main.async {
-                    self.totalKeystrokeCount = newTotal
+                let reconciledTotal = self.cachedSyncData.totalCount(for: today)
+                if reconciledTotal != self.totalKeystrokeCount {
+                    self.totalKeystrokeCount = reconciledTotal
                     self.updateMenuBarTitle()
                 }
             }
@@ -395,6 +469,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            state.date != today {
             localKeystrokeCount = 0
             localAppCounts = [:]
+            localExtras = DayExtras()
+            lastTypingKeyTime = nil
             totalKeystrokeCount = 0
             loadAndReconcileCounts()
         }
@@ -431,20 +507,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func getStats() -> (today: Int, yesterday: Int, avg7: Double, avg30: Double, recordCount: Int, recordDate: String?) {
-        guard let url = syncFileURL else {
-            return (totalKeystrokeCount, 0, 0, 0, totalKeystrokeCount, nil)
-        }
-
-        let syncData = loadSyncData(from: url)
         let today = todayString()
         let yesterday = yesterdayString()
 
-        let todayCount = syncData.totalCount(for: today)
-        let yesterdayCount = syncData.totalCount(for: yesterday)
-        let avg7 = syncData.averageCount(forLastDays: 7, from: Date())
-        let avg30 = syncData.averageCount(forLastDays: 30, from: Date())
-
-        let record = syncData.recordDay()
+        let todayCount = cachedSyncData.totalCount(for: today)
+        let yesterdayCount = cachedSyncData.totalCount(for: yesterday)
+        let avg7 = cachedSyncData.averageCount(forLastDays: 7, from: Date())
+        let avg30 = cachedSyncData.averageCount(forLastDays: 30, from: Date())
+        let record = cachedSyncData.recordDay()
 
         return (todayCount, yesterdayCount, avg7, avg30, record?.count ?? 0, record?.date)
     }
@@ -571,6 +641,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         todayItem.isEnabled = false
         theMenu.addItem(todayItem)
 
+        let todayExtras = cachedSyncData.totalExtras(for: todayString())
+        if todayExtras.dictatedCount > 0 {
+            let typed = max(0, stats.today - todayExtras.dictatedCount)
+            let splitItem = NSMenuItem(
+                title: "    Typed \(formatCountFull(typed)) · Dictated \(formatCountFull(todayExtras.dictatedCount))",
+                action: nil, keyEquivalent: "")
+            splitItem.isEnabled = false
+            theMenu.addItem(splitItem)
+        }
+        let todayWPM = cachedSyncData.wpm(forDays: 1, from: Date())
+        let weekWPM = cachedSyncData.wpm(forDays: 7, from: Date())
+        func wpmPart(_ name: String, today: Double?, week: Double?) -> String? {
+            if let v = today { return "\(name) \(Int(v.rounded())) WPM" }
+            if let v = week { return "\(name) \(Int(v.rounded())) WPM (7d)" }
+            return nil
+        }
+        let wpmParts = [
+            wpmPart("Typing", today: todayWPM.typing, week: weekWPM.typing),
+            wpmPart("Speaking", today: todayWPM.speaking, week: weekWPM.speaking),
+        ].compactMap { $0 }
+        if !wpmParts.isEmpty {
+            let wpmItem = NSMenuItem(title: "Speed: " + wpmParts.joined(separator: " · "), action: nil, keyEquivalent: "")
+            wpmItem.isEnabled = false
+            theMenu.addItem(wpmItem)
+        }
+
         let yesterdayItem = NSMenuItem(title: "Yesterday: \(formatCountFull(stats.yesterday))", action: nil, keyEquivalent: "")
         yesterdayItem.isEnabled = false
         theMenu.addItem(yesterdayItem)
@@ -610,7 +706,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         theMenu.addItem(NSMenuItem.separator())
 
-        if let version = updateChecker.availableVersion {
+        if let version = updateChecker.availableVersion, updateChecker.isReadyToInstall {
+            // Already downloaded: one click installs and relaunches, no Sparkle dialog.
+            theMenu.addItem(NSMenuItem(
+                title: "Restart to Update (v\(version))",
+                action: #selector(installUpdateNow),
+                keyEquivalent: ""
+            ))
+        } else if let version = updateChecker.availableVersion {
             theMenu.addItem(NSMenuItem(
                 title: "Install Update (v\(version))...",
                 action: #selector(checkForUpdates),
@@ -670,34 +773,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        // Sync local data to cloud before showing menu (like openHistory does)
-        if let url = syncFileURL {
-            checkDayChange()
-            saveLocalCount()
-            let today = todayString()
-            let currentCount = localKeystrokeCount
-            let currentAppCounts = localAppCounts
-            coordinatedSync(to: url, forceMerge: false) { existingData in
-                var syncData = existingData
-                if syncData.devices[self.deviceID] == nil {
-                    syncData.devices[self.deviceID] = DeviceData()
-                }
-                let existingCount = syncData.devices[self.deviceID]?.count(for: today) ?? 0
-                if currentCount > existingCount {
-                    syncData.devices[self.deviceID]?.setCount(currentCount, for: today, appCounts: currentAppCounts.isEmpty ? nil : currentAppCounts)
-                }
-                return syncData
-            }
-
-            // Load the merged data and update the menu bar title
-            let syncData = loadSyncData(from: url)
-            let newTotal = syncData.totalCount(for: today)
-            if newTotal != totalKeystrokeCount {
-                totalKeystrokeCount = newTotal
-                updateMenuBarTitle()
-            }
-        }
+        checkDayChange()
         rebuildMenu()
+        // Clicking the status item surfaces any open History/About windows behind the menu.
+        for window in [historyWindowController?.window, aboutWindowController?.window].compactMap({ $0 })
+            where window.isVisible && !window.isMiniaturized {
+            window.orderFrontRegardless()
+        }
     }
 
     private func updateMenuBarTitle() {
@@ -751,25 +833,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let url = syncFileURL else { return }
 
         checkDayChange()
-        saveLocalCount()
-        let today = todayString()
-        let currentCount = localKeystrokeCount
-        let currentAppCounts = localAppCounts
-        coordinatedSync(to: url, forceMerge: false) { existingData in
-            var syncData = existingData
-            if syncData.devices[self.deviceID] == nil {
-                syncData.devices[self.deviceID] = DeviceData()
-            }
-            let existingCount = syncData.devices[self.deviceID]?.count(for: today) ?? 0
-            if currentCount > existingCount {
-                syncData.devices[self.deviceID]?.setCount(currentCount, for: today, appCounts: currentAppCounts.isEmpty ? nil : currentAppCounts)
-            }
-            return syncData
+
+        // Reuse the open window instead of stacking a new one per click.
+        if let existing = historyWindowController?.window, existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
 
-        let syncData = loadSyncData(from: url)
-
-        historyWindowController = HistoryWindowController(syncData: syncData, dataFileURL: url)
+        historyWindowController = HistoryWindowController(syncData: cachedSyncData, dataFileURL: url) { [weak self] in
+            self?.cachedSyncData ?? SyncData()
+        }
         historyWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -785,24 +859,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             localKeystrokeCount = 0
             localAppCounts = [:]
+            localExtras = DayExtras()
+            lastTypingKeyTime = nil
             saveLocalCount()
 
-            guard let url = syncFileURL else { return }
             let today = todayString()
 
-            coordinatedSync(to: url, forceMerge: false) { existingData in
-                var syncData = existingData
-                if syncData.devices[self.deviceID] == nil {
-                    syncData.devices[self.deviceID] = DeviceData()
-                }
-                syncData.devices[self.deviceID]?.setCount(0, for: today, appCounts: nil)
-                return syncData
+            if cachedSyncData.devices[deviceID] == nil {
+                cachedSyncData.devices[deviceID] = DeviceData()
             }
-
-            let syncData = loadSyncData(from: url)
-            totalKeystrokeCount = syncData.totalCount(for: today)
-
+            cachedSyncData.devices[deviceID]?.setCount(0, for: today, appCounts: nil)
+            totalKeystrokeCount = cachedSyncData.totalCount(for: today)
             updateMenuBarTitle()
+
+            // Write reset to iCloud file async
+            if let url = syncFileURL {
+                syncQueue.async {
+                    self.coordinatedSync(to: url, forceMerge: false) { existingData in
+                        var syncData = existingData
+                        if syncData.devices[self.deviceID] == nil {
+                            syncData.devices[self.deviceID] = DeviceData()
+                        }
+                        syncData.devices[self.deviceID]?.setCount(0, for: today, appCounts: nil)
+                        return syncData
+                    }
+                }
+            }
         }
     }
 
@@ -830,6 +912,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func installUpdateNow() {
+        // Persist today's counts before Sparkle terminates and relaunches the app.
+        saveLocalCount()
+        updateChecker.installUpdate()
+    }
+
     @objc private func checkForUpdates() {
         updateChecker.checkForUpdates()
         NSApp.activate(ignoringOtherApps: true)
@@ -849,12 +937,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: eventMask,
-            callback: { (_, _, event, refcon) -> Unmanaged<CGEvent>? in
+            callback: { (_, type, event, refcon) -> Unmanaged<CGEvent>? in
                 if let refcon = refcon {
                     let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
-                    appDelegate.handleKeyEvent()
+                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        // macOS disables slow taps; turn it back on instead of silently stopping.
+                        if let tap = appDelegate.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    } else if type == .keyDown {
+                        appDelegate.handleKeyEvent(event)
+                    }
                 }
-                return Unmanaged.passRetained(event)
+                return Unmanaged.passUnretained(event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
@@ -867,24 +960,97 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
-    func handleKeyEvent() {
+    func handleKeyEvent(_ event: CGEvent) {
         checkDayChange()
 
         // Track which app received this keystroke
         let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
-        localAppCounts[bundleID, default: 0] += 1
 
-        localKeystrokeCount += 1
-        totalKeystrokeCount += 1
+        // Real key presses report source PID 0; synthetic events carry the poster's PID.
+        let sourcePID = pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventSourceUnixProcessID))
+        let isSynthetic = sourcePID != 0 && sourcePID != getpid()
+        let dictationApp = isSynthetic ? DictationSources.dictationApp(forPID: sourcePID) : nil
+
+        let added: Int
+        if let dictationApp = dictationApp {
+            guard isPasteShortcut(event), let chars = dictatedCharacters() else {
+                // Other synthetic keys from a dictation app (auto-Enter, Backspace…) aren't typing.
+                return
+            }
+            added = chars
+            localExtras.dictatedCount = localExtras.dictatedCount.saturatingAdd(chars)
+            localExtras.dictatedAppCounts[bundleID] = (localExtras.dictatedAppCounts[bundleID] ?? 0).saturatingAdd(chars)
+            if let seconds = micTracker.claimSession(for: dictationApp) {
+                localExtras.speakingSeconds += seconds
+                localExtras.speakingChars = localExtras.speakingChars.saturatingAdd(chars)
+            }
+        } else {
+            added = 1
+            if !isSynthetic {
+                recordTypingTiming()
+            }
+        }
+
+        localAppCounts[bundleID, default: 0] += added
+        localKeystrokeCount += added
+        totalKeystrokeCount += added
+
+        // Keep cache current so menu reads never hit disk
+        if cachedSyncData.devices[deviceID] == nil {
+            cachedSyncData.devices[deviceID] = DeviceData()
+        }
+        cachedSyncData.devices[deviceID]?.setCount(localKeystrokeCount, for: todayString(), appCounts: localAppCounts.isEmpty ? nil : localAppCounts, extras: localExtras)
 
         updateMenuBarTitle()
 
-        if localKeystrokeCount % 50 == 0 {
+        // Thresholds are cumulative because dictation adds many characters at once.
+        unsavedCount += added
+        unsyncedCount += added
+        if unsavedCount >= 50 {
             saveLocalCount()
         }
 
-        if localKeystrokeCount % 1000 == 0 {
+        // Flush to iCloud file in background
+        if unsyncedCount >= 1000 {
             syncToCloud()
         }
+    }
+
+    // MARK: - Dictation & WPM
+
+    private func isPasteShortcut(_ event: CGEvent) -> Bool {
+        let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        return keycode == 9 /* kVK_ANSI_V */ && event.flags.contains(.maskCommand)
+    }
+
+    /// Length of the transcript on the clipboard. Read synchronously inside the tap, before
+    /// the target app handles the paste and before the dictation app restores the clipboard.
+    /// Only the length is used; the text is never stored, logged, or synced.
+    /// Runs only for synthetic Cmd+V from an allowlisted dictation app, so password-manager
+    /// pastes aren't sampled. Concealed/transient markers can't be used as a filter because
+    /// dictation apps (e.g. Aqua) set them on their own transcripts.
+    private func dictatedCharacters() -> Int? {
+        let pasteboard = NSPasteboard.general
+        let types = pasteboard.types ?? []
+        // Universal Clipboard content would need a network fetch; dictation apps write locally.
+        guard types.contains(.string),
+              !types.contains(NSPasteboard.PasteboardType("com.apple.is-remote-clipboard")),
+              let text = pasteboard.string(forType: .string) else { return nil }
+        // NSString length (UTF-16 units) is O(1), so long pastes can't stall the event tap.
+        let length = (text as NSString).length
+        return length > 0 ? length : nil
+    }
+
+    /// Accumulate active typing time from gaps between hardware keystrokes.
+    private func recordTypingTiming() {
+        let now = Date()
+        if let last = lastTypingKeyTime {
+            let gap = now.timeIntervalSince(last)
+            if gap >= 0 && gap <= typingIdleThreshold {
+                localExtras.typingSeconds += gap
+                localExtras.typingKeys = localExtras.typingKeys.saturatingAdd(1)
+            }
+        }
+        lastTypingKeyTime = now
     }
 }
